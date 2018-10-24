@@ -12,6 +12,7 @@ use Symfony\Component\DependencyInjection\Exception\ParameterNotFoundException;
 
 /**
  * @author Jakub Kulhan <jakub.kulhan@gmail.com>
+ * @author Jan Smitka <jan.smitka@lynt.cz>
  */
 class AutoscanCompilerPass implements CompilerPassInterface
 {
@@ -38,43 +39,31 @@ class AutoscanCompilerPass implements CompilerPassInterface
 		}
 
 		try {
-			$fastAnnotationChecksRegex = implode("|", array_map(function ($s) {
-				return preg_quote($s);
-			}, (array)$parameterBag->resolveValue("%autowiring.fast_annotation_checks%")));
+			$fastAnnotationChecks = $parameterBag->resolveValue("%autowiring.fast_annotation_checks%");
 		} catch (ParameterNotFoundException $e) {
-			$fastAnnotationChecksRegex = null;
+			$fastAnnotationChecks = null;
 		}
 
-		$env = $parameterBag->resolveValue("%kernel.environment%");
-
 		// TODO: better error state handling
-		if (empty($autoscanPsr4) || empty($fastAnnotationChecksRegex)) {
+		if (empty($autoscanPsr4) || empty($fastAnnotationChecks)) {
 			return;
 		}
 
+		// Get realpaths of all autoscan directories.
+		$this->findAutoscanPsr4DirectoriesRealpaths($autoscanPsr4);
+
+		$env = $parameterBag->resolveValue("%kernel.environment%");
+
 		// TODO: more find methods than grep
-		$grep = "egrep -lir " . escapeshellarg($fastAnnotationChecksRegex);
-		foreach ($autoscanPsr4 as $ns => $dir) {
-			if (!is_dir($dir)) {
-				throw new AutowiringException(
-					sprintf("Autoscan directory '%s' does not exits.", $dir)
-				);
-			}
-
-			$autoscanPsr4[$ns] = $dir = realpath($dir);
-			$grep .= " " . escapeshellarg($dir);
-		}
-
-		if (($files = shell_exec($grep)) === null) {
-			throw new AutowiringException("Autoscan grep failed.");
+		$isWindows = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN';
+		if ($isWindows) {
+			$files = $this->autoscanWithFindstr($fastAnnotationChecks, $autoscanPsr4);
+		} else {
+			$files = $this->autoscanWithGrep($fastAnnotationChecks, $autoscanPsr4);
 		}
 
 		$classNames = [];
-		foreach (explode("\n", trim($files)) as $file) {
-			if (substr($file, -4) !== ".php") {
-				continue;
-			}
-
+		foreach ($files as $file) {
 			foreach ($autoscanPsr4 as $ns => $dir) {
 				if (strncmp($file, $dir, strlen($dir)) === 0) {
 					$fileWithoutDir = substr($file, strlen($dir), strlen($file) - strlen($dir) - 4);
@@ -108,9 +97,12 @@ class AutoscanCompilerPass implements CompilerPassInterface
 				continue;
 			}
 
+			// Ignore the exception, because the $className is from get_declared_classes().
+			/** @noinspection PhpUnhandledExceptionInspection */
 			$rc = new \ReflectionClass($className);
 
-			if (!isset($classFiles[$rc->getFileName()])) {
+			$fileName = realpath($rc->getFileName());
+			if (!isset($classFiles[$fileName])) {
 				continue;
 			}
 
@@ -156,7 +148,7 @@ class AutoscanCompilerPass implements CompilerPassInterface
 
 					$definition = new Definition($className);
 
-					if ($classFiles[$rc->getFileName()] !== $className) {
+					if ($classFiles[$fileName] !== $className) {
 						$definition->setFile($rc->getFileName());
 					}
 
@@ -166,4 +158,65 @@ class AutoscanCompilerPass implements CompilerPassInterface
 		}
 	}
 
+	private function findAutoscanPsr4DirectoriesRealpaths(array &$autoscanPsr4)
+	{
+		foreach ($autoscanPsr4 as $ns => $dir) {
+			if (!is_dir($dir)) {
+				throw new AutowiringException(
+					sprintf("Autoscan directory '%s' does not exits.", $dir)
+				);
+			}
+
+			$autoscanPsr4[$ns] = realpath($dir);
+		}
+	}
+
+	private function autoscanWithGrep($fastAnnotationChecks, array $autoscanPsr4)
+	{
+		$fastAnnotationChecksRegex = implode("|", array_map(function ($s) {
+			return preg_quote($s);
+		}, (array)$fastAnnotationChecks));
+
+		$grepCmd = "egrep -lir " . escapeshellarg($fastAnnotationChecksRegex);
+
+		foreach ($autoscanPsr4 as $ns => $dir) {
+			$grepCmd .= " " . escapeshellarg($dir);
+		}
+
+		if (($files = shell_exec($grepCmd)) === null) {
+			throw new AutowiringException("Autoscan with grep failed. Do you have the egrep utility installed?");
+		}
+
+		$result = [];
+
+		foreach (explode("\n", trim($files)) as $file) {
+			if (substr($file, -4) !== ".php") {
+				continue;
+			}
+			$result[] = realpath($file);
+		}
+
+		return $result;
+	}
+
+	private function autoscanWithFindstr($fastAnnotationChecks, array $autoscanPsr4)
+	{
+		$findstrCmd = "findstr /S /I /M " . escapeshellarg(implode(' ', $fastAnnotationChecks));
+
+		$result = [];
+		foreach ($autoscanPsr4 as $ns => $dir) {
+			$fileList = shell_exec($findstrCmd . ' ' . escapeshellarg($dir . '\\*.php'));
+			if ($fileList === null) {
+				throw new AutowiringException(
+					"Autoscan with FINDSTR failed. Do you have a recent Windows installation?"
+				);
+			}
+
+			foreach (explode("\n", trim($fileList)) as $file) {
+				$result[] = realpath($file);
+			}
+		}
+
+		return $result;
+	}
 }
